@@ -1,0 +1,26 @@
+# ===== 数据集 / 预训练权重 / 训练产物 (体积大, 不进 git) =====
+object_det_dataset/
+pretrain_models/
+runs/
+infer_res/
+logs/
+*.log
+
+# ===== 模型权重文件 =====
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# ===== Python 缓存 =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# ===== 系统垃圾文件 =====
+.DS_Store
+Thumbs.db
+
+# ===== ultralytics 运行时缓存 =====
+*.cache
