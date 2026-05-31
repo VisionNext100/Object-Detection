@@ -29,7 +29,7 @@ from ultralytics.data.loaders import (
     autocast_list,
 )
 from ultralytics.data.utils import IMG_FORMATS, VID_FORMATS
-from ultralytics.utils import RANK, colorstr
+from ultralytics.utils import LOGGER, RANK, colorstr
 from ultralytics.utils.checks import check_file
 from ultralytics.utils.torch_utils import TORCH_2_0
 
@@ -283,6 +283,42 @@ def build_grounding(
     )
 
 
+def _class_balanced_image_weights(dataset, power: float = 0.5):
+    """[Phase 4] 按每张图所含类别的稀有程度计算采样权重 (稀有类所在的图权重更高)。
+
+    思路 (沿用 YOLOv5 image_weights 思想):
+      class_weight[c] = (1 / 类别c总数) ** power   (power=0 等价于不加权, power=1 完全反频率)
+      image_weight[i] = sum_{该图的每个目标 c} class_weight[c]
+    含稀有类目标越多的图, 权重越大, 被 WeightedRandomSampler 抽中的概率越高。
+
+    Returns:
+        (np.ndarray | None): 长度为图像数的权重数组; 取不到标签时返回 None (安全降级为默认采样)。
+    """
+    try:
+        labels = dataset.labels
+        nc = int(dataset.data["nc"])
+    except Exception:
+        return None
+    if not labels or nc <= 0:
+        return None
+
+    counts = np.zeros(nc, dtype=np.float64)
+    per_image_cls = []
+    for lb in labels:
+        cls = np.asarray(lb.get("cls", [])).reshape(-1).astype(int)
+        per_image_cls.append(cls)
+        if cls.size:
+            counts += np.bincount(cls, minlength=nc)
+    counts = np.maximum(counts, 1.0)
+    class_w = (1.0 / counts) ** power
+    class_w /= class_w.sum()
+    img_w = np.array(
+        [class_w[cls].sum() if cls.size else float(class_w.mean()) for cls in per_image_cls],
+        dtype=np.float64,
+    )
+    return np.maximum(img_w, 1e-12)
+
+
 def build_dataloader(
     dataset,
     batch: int,
@@ -314,15 +350,39 @@ def build_dataloader(
     batch = min(batch, len(dataset))
     nd = torch.cuda.device_count()  # number of CUDA devices
     nw = min(os.cpu_count() // max(nd, 1), workers)  # number of workers
-    sampler = (
-        None
-        if rank == -1
-        else distributed.DistributedSampler(dataset, shuffle=shuffle)
-        if shuffle
-        else ContiguousDistributedSampler(dataset)
-    )
     generator = torch.Generator()
     generator.manual_seed(6148914691236517205 + RANK)
+
+    # === [Phase 4] 可选: 类别均衡加权采样 (仅单卡 rank==-1, 由环境变量 YOLO_CB_SAMPLER=1 开启) ===
+    # 默认关闭: 不设环境变量时行为与原版完全一致, 不影响 Phase1/2/3。
+    cb_sampler = None
+    if rank == -1 and shuffle and os.environ.get("YOLO_CB_SAMPLER", "0") == "1":
+        from torch.utils.data import WeightedRandomSampler
+
+        power = float(os.environ.get("YOLO_CB_POWER", "0.5"))
+        image_weights = _class_balanced_image_weights(dataset, power)
+        if image_weights is not None:
+            cb_sampler = WeightedRandomSampler(
+                weights=torch.as_tensor(image_weights, dtype=torch.double),
+                num_samples=len(dataset),
+                replacement=True,
+                generator=generator,
+            )
+            LOGGER.info(
+                f"{colorstr('train: ')}类别均衡采样已启用 (YOLO_CB_SAMPLER=1, power={power}), "
+                f"含稀有类的图像将被过采样"
+            )
+
+    if cb_sampler is not None:
+        sampler = cb_sampler  # 加权采样器自带随机性, 下方 shuffle 会自动置 False
+    else:
+        sampler = (
+            None
+            if rank == -1
+            else distributed.DistributedSampler(dataset, shuffle=shuffle)
+            if shuffle
+            else ContiguousDistributedSampler(dataset)
+        )
     return InfiniteDataLoader(
         dataset=dataset,
         batch_size=batch,
