@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 import torch
@@ -113,6 +114,43 @@ class BboxLoss(nn.Module):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        # === [Phase 5] 回归损失类型: ciou(默认) / eiou / wiou; 由环境变量 YOLO_IOU_TYPE 控制 ===
+        self.iou_type = os.environ.get("YOLO_IOU_TYPE", "ciou").lower()
+        self.wiou_mean = None              # WIoU v3 的 L_IoU 动量均值 (跨 batch 维护)
+        self.wiou_momentum = 0.97          # 动量系数
+        self.wiou_alpha = 1.9              # WIoU v3 非单调聚焦参数
+        self.wiou_delta = 3.0
+
+    def _wiou_loss(self, pred_bboxes, target_bboxes, weight, target_scores_sum):
+        """WIoU v3 回归损失 (针对小目标的动态非单调聚焦, https://arxiv.org/abs/2301.10051)。"""
+        eps = 1e-7
+        b1_x1, b1_y1, b1_x2, b1_y2 = pred_bboxes.chunk(4, -1)
+        b2_x1, b2_y1, b2_x2, b2_y2 = target_bboxes.chunk(4, -1)
+        w1, h1 = (b1_x2 - b1_x1), (b1_y2 - b1_y1)
+        w2, h2 = (b2_x2 - b2_x1), (b2_y2 - b2_y1)
+        inter = (b1_x2.minimum(b2_x2) - b1_x1.maximum(b2_x1)).clamp_(0) * (
+            b1_y2.minimum(b2_y2) - b1_y1.maximum(b2_y1)
+        ).clamp_(0)
+        union = w1 * h1 + w2 * h2 - inter + eps
+        iou = inter / union
+        cw = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)
+        ch = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)
+        c2 = cw.pow(2) + ch.pow(2) + eps
+        rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2).pow(2) + (b2_y1 + b2_y2 - b1_y1 - b1_y2).pow(2)) / 4
+        # R_WIoU: 包围框尺寸 detach, 避免惩罚项把框越推越大
+        r_wiou = torch.exp(rho2 / c2.detach())
+        loss_iou = 1.0 - iou
+        # v3 非单调聚焦系数 r (全程 detach, 不回传梯度)
+        with torch.no_grad():
+            l_iou_det = loss_iou.detach()
+            mean = l_iou_det.mean()
+            if self.wiou_mean is None:
+                self.wiou_mean = mean
+            else:
+                self.wiou_mean = self.wiou_momentum * self.wiou_mean + (1 - self.wiou_momentum) * mean
+            beta = l_iou_det / (self.wiou_mean + eps)
+            r = beta / (self.wiou_delta * self.wiou_alpha ** (beta - self.wiou_delta))
+        return ((r * r_wiou * loss_iou) * weight).sum() / target_scores_sum
 
     def forward(
         self,
@@ -128,8 +166,15 @@ class BboxLoss(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        # === [Phase 5] 按 YOLO_IOU_TYPE 选择回归损失 (默认 ciou, 与原版完全一致) ===
+        if self.iou_type == "wiou":
+            loss_iou = self._wiou_loss(pred_bboxes[fg_mask], target_bboxes[fg_mask], weight, target_scores_sum)
+        elif self.iou_type == "eiou":
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, EIoU=True)
+            loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        else:  # ciou (default)
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+            loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
@@ -340,6 +385,10 @@ class v8DetectionLoss:
 
         m = model.model[-1]  # Detect() module
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
+        # === [Phase 5] 分类损失类型: bce(默认) / vfl / focal; 由环境变量 YOLO_CLS_LOSS 控制 ===
+        self.cls_loss_type = os.environ.get("YOLO_CLS_LOSS", "bce").lower()
+        self.vfl_gamma = 2.0   # Varifocal/Focal 聚焦参数
+        self.vfl_alpha = 0.75  # Varifocal 平衡因子
         self.hyp = h
         self.stride = m.stride  # model strides
         self.nc = m.nc  # number of classes
@@ -422,8 +471,21 @@ class v8DetectionLoss:
 
         target_scores_sum = max(target_scores.sum(), 1)
 
-        # Cls loss
-        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        # Cls loss === [Phase 5] 按 YOLO_CLS_LOSS 选择, 归一化方式与原 BCE 完全一致 ===
+        # 用局部变量 ts, 不改动传给下方 bbox_loss 的 target_scores (保持默认路径与原版一致)
+        ts = target_scores.to(dtype)
+        if self.cls_loss_type == "vfl":
+            # Varifocal: IoU-aware 软标签, 正样本用 gt_score 加权, 负样本用 alpha*p^gamma 抑制
+            label = (ts > 0).to(dtype)
+            vfl_weight = self.vfl_alpha * pred_scores.sigmoid().pow(self.vfl_gamma) * (1 - label) + ts * label
+            loss[1] = (self.bce(pred_scores, ts) * vfl_weight).sum() / target_scores_sum
+        elif self.cls_loss_type == "focal":
+            bce = self.bce(pred_scores, ts)
+            p_t = ts * pred_scores.sigmoid() + (1 - ts) * (1 - pred_scores.sigmoid())
+            focal_weight = (1.0 - p_t).pow(self.vfl_gamma)
+            loss[1] = (bce * focal_weight).sum() / target_scores_sum
+        else:  # bce (default, 与原版完全一致)
+            loss[1] = self.bce(pred_scores, ts).sum() / target_scores_sum
 
         # Bbox loss
         if fg_mask.sum():
