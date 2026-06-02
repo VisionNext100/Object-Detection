@@ -18,8 +18,9 @@ CLASS_NAMES = {
 
 
 def xyxy_to_xywh(box):
+    # 保留 2 位小数: mAP@0.5 下 0.01px 精度完全足够, 但能显著缩小 json 体积
     x1, y1, x2, y2 = box
-    return [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
+    return [round(float(x1), 2), round(float(y1), 2), round(float(x2 - x1), 2), round(float(y2 - y1), 2)]
 
 
 def run_inference(model_path, test_dir, save_json, conf_thres, imgsz, iou, augment):
@@ -59,7 +60,7 @@ def run_inference(model_path, test_dir, save_json, conf_thres, imgsz, iou, augme
                 "file_name": img_name,
                 "category_id": int(cls_id),
                 "bbox": xyxy_to_xywh(box),
-                "score": float(score),
+                "score": round(float(score), 5),
             })
 
     os.makedirs(os.path.dirname(save_json), exist_ok=True)
